@@ -1,12 +1,30 @@
 var http = require('http');
-var request = require('request');
 
-module.exports = function(_raft) {
-	var raft = _raft;
+var HTTP_SUCCESS = 200;
+
+module.exports = function(raft) {
+	_this = this;
+	this.raft = raft;
+	this.methods = {};
+
+	function log(msg) {
+		if(GLOBAL.logger) {
+			GLOBAL.logger.log('(HttpServer) ' + msg);
+		}
+	}
+
+	function handleRPC(method, params, success, error) {
+		if(_this.methods[method] instanceof Function) {
+			_this.methods[method](params, success, error);
+		} else {
+			error({
+				message: 'undefined RPC: ' + method
+			});
+		}
+	}
 
 	return {
 		create: function (host, port) {
-
 			http.createServer(function(req, res) {
 				var success = function(responseObject) {
 					responseBody = JSON.stringify(responseObject);
@@ -39,33 +57,11 @@ module.exports = function(_raft) {
 						var rpcRequestObject = JSON.parse(payload);
 						handleRPC(rpcRequestObject.method, rpcRequestObject.params, success, error);
 					} catch(e) {
+						log('failed to handle RPC: ' + e);
 						error(e);
 					}
 				});
 			}).listen(port, host);
-		},
-		handleRPC: function(method, params, success, error) {
-			if(!raft) {
-				error({
-					message: 'Raft is not initialized'
-				});
-			}
-
-			switch(method) {
-				case 'RequestVote':
-					raft.requestVote(params, success, error);
-					break;
-				case 'followerAppendEntries':
-					raft.followerAppendEntries(params, success, error);
-					break;
-				case 'appendEntry':
-					raft.appendEntry(params, success, error);
-					break;
-				default:
-					error({
-						message: 'undefined RPC: ' + method
-					});
-			}
 		},
 		invokeRPC: function(remoteServerId, method, params, success, error) {
 			var payload = JSON.stringify({
@@ -73,7 +69,7 @@ module.exports = function(_raft) {
 				params: params
 			});
 
-			var req = http.request({
+			var options = {
 				host: GLOBAL.servers[remoteServerId].host,
 				port: GLOBAL.servers[remoteServerId].port,
 				path: '/',
@@ -82,7 +78,11 @@ module.exports = function(_raft) {
 					'Content-Type': 'application/json',
 					'Content-Length': Buffer.byteLength(payload)
 				}
-			}, function(res) {
+			};
+
+			var req = http.request(options, function(res) {
+				var callback = res.statusCode === HTTP_SUCCESS ? success : error;
+
 				res.setEncoding('utf-8');
 				var payload = '';
 				res.on('data', function(chunk) {
@@ -98,11 +98,15 @@ module.exports = function(_raft) {
 			});
 
 			req.on('error', function(e) {
+				log('error in invokeRPC: ' + e.message + ', options: ' + JSON.stringify(options));
 				error(e);
 			});
 
 			req.write(payload);
 			req.end();
+		},
+		regsiterMethod: function(methodName, callback) {
+			_this.methods[methodName] = callback;
 		}
 	};
 };

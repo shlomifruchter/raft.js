@@ -17,7 +17,7 @@ var Raft = function(options) {
 	var _this = this;
 	this.eventBus = new EventEmitter();
 	this.storage = new Storage(options.serverId);
-	this.httpServer = new HttpServer(this); // TODO: remove coupling between HttpServer and Raft by implementing an event based communication
+	this.httpServer = new HttpServer();
 
 	// Persistent state
 	this.state = {
@@ -71,12 +71,18 @@ var Raft = function(options) {
 		});
 
 		_this.eventBus.on('role:change', function(oldRole, newRole) {
-			if(_this.role == ROLES.LEADER) {
+			if(_this.role === ROLES.LEADER) {
 				// start sending heartbeat message
 				resetHeartbeatTimeout();
+
+				// stop election timeout
+				clearTimeout(_this.electionTimeout); 
 			} else {
 				// stop sending heartbeat message
 				clearTimeout(_this.heartbeatTimeout);
+
+				// start election timeout
+				resetElectionTimeout();
 			}
 
 			log("converted to " + roleNameById(_this.role));
@@ -89,12 +95,13 @@ var Raft = function(options) {
 		if(_this.heartbeatTimeout) {
 			clearTimeout(heartbeatTimeout);
 		}
+		
 		_this.heartbeatTimeout = setTimeout(function() {
 			// send initial empty AppendEntries RPCs (heartbeat) to each server; repeat during idle periods to prevent election timeouts
 			resetHeartbeatTimeout();
 
 			for(var id in GLOBAL.servers) {
-				httpServer.invokeRPC(id, 'followerAppendEntries', {
+				httpServer.invokeRPC(id, 'FollowerAppendEntries', {
 					term: _this.state.currentTerm,
 					leaderId: _this.serverId,
 					prevLogIndex: null,
@@ -123,32 +130,46 @@ var Raft = function(options) {
 
 		if(GLOBAL.servers) {
 			log('start election');
-			var votes = 0;
+			var votes = 1; // voted for self
 
 			// Send RequestVote RPCs to all other servers
 			for(var id in GLOBAL.servers) {
+				var currentId = parseInt(id);
+				// Skip self
+				if(currentId === _this.serverId) {
+					continue;
+				}
+
 				var lastLogIndex = _this.state.log.length - 1;
-				log('RequestVote -> server ' + id);
-				_this.httpServer.invokeRPC(id, 'RequestVote', {
+				log('RequestVote -> server ' + currentId);
+				_this.httpServer.invokeRPC(currentId, 'RequestVote', {
 					term: _this.state.currentTerm,
 					candidateId: _this.serverId,
 					lastLogIndex: lastLogIndex,
 					lastLogTerm: lastLogIndex >= 0 ? _this.state.log[lastLogIndex].term : null
-				}, function(response) { // success
-					if(_this.role != ROLES.CANDIDATE) { // Reject responses if no longer a candidate
-						return;
-					}
-
-					if(response.voteGranted) {
-						votes++;
-
-						// If votes received from majority of servers: become leader
-						if(votes > (GLOBAL.servers.length/2 + 1) ) {
-							setRole(ROLES.LEADER);
+				}, function(_currentId) {
+					return function(response) { // success
+						if(_this.role != ROLES.CANDIDATE) { // Reject responses if no longer a candidate
+							log('rejected RequestVote response: not a candidate');
+							return;
 						}
-					}
-				}, function(response) { // error
-					log('Remote server responded with error in response to RequestVote: ' + JSON.stringify(response));
+
+						if(response.voteGranted === true) {
+							votes++;
+							log('got voted by server ' + _currentId + ', total positive votes: ' + votes);
+
+							// If votes received from majority of servers: become leader
+							if(votes > (GLOBAL.servers.length/2 + 1) ) {
+								setRole(ROLES.LEADER);
+							}
+						} else if (response.voteGranted === false) {
+							log('vote rejected by server ' + _currentId);
+						} else {
+							log('Remote server responded with invalid voteGranted value: ' + JSON.stringify(response.voteGranted));
+						}
+					};
+				}(currentId), function(e) { // error
+					log('failed to invoke RequestVote: ' + JSON.stringify(e));
 				});
 			}
 		} else {
@@ -171,7 +192,7 @@ var Raft = function(options) {
 
 	function log(msg) {
 		if(GLOBAL.logger) {
-			GLOBAL.logger.log(msg);
+			GLOBAL.logger.log('(Raft) ' + msg);
 		}
 	}
 
@@ -229,99 +250,112 @@ var Raft = function(options) {
 	initialize(options);
 
 	//////////////////////////////////////////////////
-	// Public interface
+	// Public interface (RPCs)
 	//////////////////////////////////////////////////
+
+	/*
+	// RequestVote RPC
+	// 
+	// params: {
+	//	term,
+	//	candidateId,
+	//	lastLogIndex,
+	//  lastLogTerm
+	// }
+	*/
+	this.requestVote = function(params, success, error) {
+		log('<- RequestVote');
+		var response = {
+			term: _this.state.currentTerm
+		};
+		if(params.term < _this.state.currentTerm) { // Reply false if term < currentTerm
+			response.voteGranted = false;
+		} else if (_this.state.votedFor == null || _this.state.votedFor == params.candidateId) {
+			// If votedFor is null or candidateId, and candidate's log is at 
+			// least as up-to-date as receiver’s log, grant vote
+			resetElectionTimeout();
+			response.voteGranted = true;
+		}
+
+		success(response);
+	};
+
+	/* 
+	// AppendEntries RPC
+	//
+	// Invoked by leader to replicate log entries, also used as heartbeat
+	// params: {
+	//	term,
+	// 	leaderId,
+	//	prevLogIndex,
+	// 	prevLogTerm,
+	//  entries,
+	//  leaderCommit
+	// }
+	*/
+	this.followerAppendEntries = function(params, success, error) {
+		log('<- FollowerAppendEntries');
+		var response = {
+			term: _this.state.currentTerm
+		};
+
+		// Reply false if term < currentTerm (reject RPC calls from stale leaders)
+		if(params.term < _this.state.currentTerm) {
+			response.success = false;
+			success(response);
+			return;
+		}
+
+		// Update leader, reset election timeout
+		_this.currentLeader = leaderId;
+		resetElectionTimeout();
+
+		// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
+		if(params.term > _this.state.currentTerm) {
+			_this.state.currentTerm = params.term;
+			setRole(ROLES.FOLLOWER);
+		}
+	};
+
+	/*
+	// Invoked by client to append a new entry to the log. Follower redirect this call to leader.
+	// params: {
+	//	 entry
+	// }
+	*/
+	this.appendEntry = function(params, sucess, error) {
+		// Leader: if command received from client, append entry to local log, 
+		// respond after entry applied to state machine
+		if(_this.role == ROLES.LEADER) {
+			_this.state.log.push({
+				term: _this.state.currentTerm,
+				entry: params.entry
+			});
+			applyLogEntry(_this.state.log.length - 1, success, error);
+
+			// send 
+			resetHeartbeatTimeout();
+		} else { // followers and candidates redirect calls to leader
+			if(_this.currentLeader) {
+				success({
+					redirect: _this.currentLeader
+				});
+			} else {
+				error({
+					message: 'Cannot append entry: no leader is known'
+				});
+			}
+		}
+	};
+
+	// Register HTTP handlers
+	this.httpServer.regsiterMethod('RequestVote', this.requestVote);
+	this.httpServer.regsiterMethod('FollowerAppendEntries', this.followerAppendEntries);
+	this.httpServer.regsiterMethod('AppendEntry', this.appendEntry);
+
 	return {
 		start: function() {
 			_this.httpServer.create(_this.host, _this.port);
-		},
-		/*
-		// RequestVote RPC
-		// 
-		// params: {
-		//	term,
-		//	candidateId,
-		//	lastLogIndex,
-		//  lastLogTerm
-		// }
-		*/
-		requestVote: function(params, success, error) {
-			var response = {};
-			if(params.term < _this.state.currentTerm) { // Reply false if term < currentTerm
-				response.term = _this.state.currentTerm;
-				response.voteGranted = false;
-			} else if (_this.state.votedFor == null || _this.state.votedFor == params.candidateId) {
-				// If votedFor is null or candidateId, and candidate's log is at 
-				// least as up-to-date as receiver’s log, grant vote
-				resetElectionTimeout();
-			}
-
-			success(response);
-		},
-		/* 
-		// AppendEntries RPC
-		//
-		// Invoked by leader to replicate log entries, also used as heartbeat
-		// params: {
-		//	term,
-		// 	leaderId,
-		//	prevLogIndex,
-		// 	prevLogTerm,
-		//  entries,
-		//  leaderCommit
-		// }
-		*/
-		followerAppendEntries: function(params, success, error) {
-			var response = {
-				term: _this.state.currentTerm
-			};
-
-			// Reply false if term < currentTerm (reject RPC calls from stale leaders)
-			if(params.term < _this.state.currentTerm) {
-				response.success = false;
-				success(response);
-				return;
-			}
-
-			// Update leader, reset election timeout
-			_this.currentLeader = leaderId;
-			resetElectionTimeout();
-
-			// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-			if(params.term > _this.state.currentTerm) {
-				_this.state.currentTerm = params.term;
-				setRole(ROLES.FOLLOWER);
-			}
-		},
-		/*
-		// Invoked by client to append a new entry to the log. Follower redirect this call to leader.
-		// params: {
-		//	 entry
-		// }
-		*/
-		appendEntry: function(params, sucess, error) {
-			// Leader: if command received from client, append entry to local log, 
-			// respond after entry applied to state machine
-			if(_this.role == ROLES.LEADER) {
-				_this.state.log.push({
-					term: _this.state.currentTerm,
-					entry: params.entry
-				});
-				applyLogEntry(_this.state.log.length - 1, success, error);
-
-				// send 
-				resetHeartbeatTimeout();
-			} else { // followers and candidates redirect calls to leader
-				if(_this.currentLeader) {
-					success({
-						redirect: _this.currentLeader
-					});
-				} else {
-					error({
-						message: 'Cannot append entry: no leader is known'
-					});
-				}
-			}
 		}
 	};
 };

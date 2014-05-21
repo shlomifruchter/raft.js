@@ -28,7 +28,7 @@ var Logger = function(options) {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				'Content-Length': payload.length
+				'Content-Length': Buffer.byteLength(payload)
 			}
 		});
 
@@ -49,10 +49,13 @@ var Logger = function(options) {
 			});
 
 			req.on('end', function() {
+				var msg = 'Message logged';
 				res.writeHead(200, {
-					'Content-Type': 'text/plain'
+					'Content-Type': 'text/plain',
+					'Content-Length': Buffer.byteLength(msg)
 				});
-				res.end('Message logged');
+				res.write(msg);
+				res.end();
 			})
 		});
 

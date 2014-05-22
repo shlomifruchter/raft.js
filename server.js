@@ -3,7 +3,7 @@ var Logger = require('./Logger');
 var Raft = require('./Raft');
 
 GLOBAL.config = {
-	numServers: 2
+	numServers: 3
 };
 var host = 'localhost';
 var portRangeStart = 8080;
@@ -23,20 +23,23 @@ var port = portRangeStart + serverId;
 
 // Setup logger
 GLOBAL.logger = new Logger({
-	deferLogging: role != 'logger',
+	listenForRemoteLogs: role === 'logger',
+	deferLogging: false, // role != 'logger',
 	logServerHost: 'localhost',
 	logServerPort: 7770,
 	serverId: serverId
 });
 
+var raft = null;
+
 if(role != 'logger') {
 	// Setup Raft
-	var raft = new Raft({
+	raft = new Raft({
 		serverId: serverId,
 		host: host,
 		port: port,
-		electionTimeoutInterval: 2000,
-		heartbeatTimeoutInterval: 1000
+		electionTimeoutInterval: 4000,
+		heartbeatTimeoutInterval: 500
 	});
 
 	raft.start();

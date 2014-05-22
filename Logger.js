@@ -2,10 +2,12 @@ var http = require('http');
 
 var Logger = function(options) {
 
-	var options = options;
 	var _this = this;
+	this.options = options;
 
 	this.log = function(msg) {
+		var timestamp = (new Date()).toISOString();
+		msg = timestamp + " --- " + msg;
 		if(options.deferLogging) {
 			_this._deferLog(msg);
 		} else {
@@ -16,31 +18,32 @@ var Logger = function(options) {
 	this._deferLog = function(msg) {
 		var messageJson = {
 			msg: msg,
-			serverId: options.serverId
+			serverId: _this.options.serverId
 		};
 
 		var payload = JSON.stringify(messageJson);
-
-		var req = http.request({
-			host: options.logServerHost,
-			port: options.logServerPort,
+		var options = {
+			host: _this.options.logServerHost,
+			port: _this.options.logServerPort,
 			path: '/',
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
 				'Content-Length': Buffer.byteLength(payload)
 			}
-		});
+		};
+
+		var req = http.request(options);
 
 		req.on('error', function(e) {
-			console.log('failed to write to log server: ' + e)
+			console.log('failed to write to log server: ' + JSON.stringify(e) + ', payload: ' + payload + ', options' + JSON.stringify(options));
 		});
 
 		req.write(payload);
 		req.end();
 	};
 
-	if(!options.deferLogging) { // setup log server
+	if(options.listenForRemoteLogs) { // setup log server
 		this.server = http.createServer(function(req,res) {
 			req.setEncoding('utf8');
 			req.on('data', function(payload) {

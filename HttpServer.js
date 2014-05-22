@@ -25,7 +25,7 @@ module.exports = function(raft) {
 
 	return {
 		create: function (host, port) {
-			http.createServer(function(req, res) {
+			_this.httpServer = http.createServer(function(req, res) {
 				var success = function(responseObject) {
 					responseBody = JSON.stringify(responseObject);
 					res.writeHead(200, {
@@ -76,7 +76,7 @@ module.exports = function(raft) {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/json',
-					'Content-Length': Buffer.byteLength(payload)
+					'Content-Length': Buffer.byteLength(payload),
 				}
 			};
 

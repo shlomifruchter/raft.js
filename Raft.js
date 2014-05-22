@@ -15,9 +15,10 @@ var Raft = function(options) {
 	//////////////////////////////////////////////////
 
 	var _this = this;
-	this.eventBus = new EventEmitter();
-	this.storage = new Storage(options.serverId);
-	this.httpServer = new HttpServer();
+	this.options = options;
+	_this.eventBus = new EventEmitter();
+	_this.storage = new Storage(_this.options.serverId);
+	_this.httpServer = new HttpServer();
 
 	// Persistent state
 	this.state = {
@@ -71,68 +72,35 @@ var Raft = function(options) {
 		});
 
 		_this.eventBus.on('role:change', function(oldRole, newRole) {
+			log("converted to " + roleNameById(_this.role) + " state: " + dumpState());
+
 			if(_this.role === ROLES.LEADER) {
 				// start sending heartbeat message
 				resetHeartbeatTimeout();
 
 				// stop election timeout
-				clearTimeout(_this.electionTimeout); 
+				clearElectionTimeout();
 			} else {
 				// stop sending heartbeat message
-				clearTimeout(_this.heartbeatTimeout);
+				clearHeartbeatTimeout();
 
-				// start election timeout
-				resetElectionTimeout();
+				// Election timout must be started explictly when changing role
 			}
-
-			log("converted to " + roleNameById(_this.role));
 		});
 	}
 
 	// Leader
 
 	function resetHeartbeatTimeout() {
-		if(_this.heartbeatTimeout) {
-			clearTimeout(heartbeatTimeout);
-		}
+		clearHeartbeatTimeout();
 		
 		_this.heartbeatTimeout = setTimeout(function() {
-			// send initial empty AppendEntries RPCs (heartbeat) to each server; repeat during idle periods to prevent election timeouts
+			log('send heartbeat');
+
+			// send initial empty AppendEntries RPCs (heartbeat) to each server;
+			// repeat during idle periods to prevent election timeouts
 			resetHeartbeatTimeout();
 
-			for(var id in GLOBAL.servers) {
-				httpServer.invokeRPC(id, 'FollowerAppendEntries', {
-					term: _this.state.currentTerm,
-					leaderId: _this.serverId,
-					prevLogIndex: null,
-					prevLogTerm: null,
-					entries: [],
-					leaderCommit: _this.commitIndex
-				}, function(response) { // success
-
-				}, function(response) { // error
-
-				});
-			}
-		}, _this.heartbeatTimeoutInterval);
-	}
-
-	// EO Leader
-
-	// Election phase
-	function startElection() {
-
-		setRole(ROLES.CANDIDATE); // convert to candidate
-
-		_this.state.currentTerm++;
-		_this.votedFor = _this.serverId;
-		resetElectionTimeout();
-
-		if(GLOBAL.servers) {
-			log('start election');
-			var votes = 1; // voted for self
-
-			// Send RequestVote RPCs to all other servers
 			for(var id in GLOBAL.servers) {
 				var currentId = parseInt(id);
 				// Skip self
@@ -140,48 +108,123 @@ var Raft = function(options) {
 					continue;
 				}
 
-				var lastLogIndex = _this.state.log.length - 1;
-				log('RequestVote -> server ' + currentId);
-				_this.httpServer.invokeRPC(currentId, 'RequestVote', {
+				log('FollowerAppendEntries -> server ' + currentId);
+				_this.httpServer.invokeRPC(currentId, 'FollowerAppendEntries', {
 					term: _this.state.currentTerm,
-					candidateId: _this.serverId,
-					lastLogIndex: lastLogIndex,
-					lastLogTerm: lastLogIndex >= 0 ? _this.state.log[lastLogIndex].term : null
+					leaderId: _this.serverId,
+					prevLogIndex: null,
+					prevLogTerm: null,
+					entries: [],
+					leaderCommit: _this.commitIndex
 				}, function(_currentId) {
 					return function(response) { // success
-						if(_this.role != ROLES.CANDIDATE) { // Reject responses if no longer a candidate
-							log('rejected RequestVote response: not a candidate');
+						refreshTerm(response.term);
+
+						if(_this.role != ROLES.LEADER) { // Reject responses if no longer a leader
+							log('rejected FollowerAppendEntries response: not a leader');
 							return;
 						}
 
-						if(response.voteGranted === true) {
-							votes++;
-							log('got voted by server ' + _currentId + ', total positive votes: ' + votes);
+						log('FollowerAppendEntries response: ' + JSON.stringify(response));
 
-							// If votes received from majority of servers: become leader
-							if(votes > (GLOBAL.servers.length/2 + 1) ) {
-								setRole(ROLES.LEADER);
-							}
-						} else if (response.voteGranted === false) {
-							log('vote rejected by server ' + _currentId);
+						if(response.success === true) {
+							//  update nextIndex and matchIndex for follower
+						} else if(response.success === false) {
+							// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
 						} else {
-							log('Remote server responded with invalid voteGranted value: ' + JSON.stringify(response.voteGranted));
+							log('remote server responded with invalid success value: ' + JSON.stringify(response.success));
 						}
 					};
 				}(currentId), function(e) { // error
-					log('failed to invoke RequestVote: ' + JSON.stringify(e));
+					log('failed to invoke FollowerAppendEntries: ' + JSON.stringify(e));
 				});
 			}
-		} else {
+		}, _this.heartbeatTimeoutInterval);
+	}
+
+	function clearHeartbeatTimeout() {
+		if(_this.heartbeatTimeout != null) {
+			clearTimeout(_this.heartbeatTimeout);
+			_this.heartbeatTimeout = null;
+		}
+	}
+
+	// EO Leader
+
+	// Election phase
+	function startElection() {
+		setRole(ROLES.CANDIDATE); 	// convert to candidate
+		_this.state.currentTerm++;	// increment current Term
+		_this.state.votedFor = _this.serverId; // vote for self
+		resetElectionTimeout(); 	// reset election timeout
+
+		if(!GLOBAL.servers) {
 			throw 'GLOBAL.servers is undefined';
+		}
+
+		log('start election');
+
+		var votes = 1; // voted for self
+
+		// Send RequestVote RPCs to all other servers
+		for(var id in GLOBAL.servers) {
+			var currentId = parseInt(id);
+			// Skip self
+			if(currentId === _this.serverId) {
+				continue;
+			}
+
+			var lastLogIndex = _this.state.log.length - 1;
+			log('RequestVote -> server ' + currentId);
+
+			_this.httpServer.invokeRPC(currentId, 'RequestVote', {
+				term: _this.state.currentTerm,
+				candidateId: _this.serverId,
+				lastLogIndex: lastLogIndex,
+				lastLogTerm: lastLogIndex >= 0 ? _this.state.log[lastLogIndex].term : null
+			}, function(_currentId) {
+				return function(response) { // success
+					refreshTerm(response.term);
+
+					if(_this.role != ROLES.CANDIDATE) { // Reject response if no longer a candidate
+						log('rejected RequestVote response: not a candidate');
+						return;
+					}
+
+					if(response.voteGranted === true) {
+						votes++;
+						log('got voted by server ' + _currentId + ', total positive votes: ' + votes);
+
+						// If votes received from majority of servers: become leader
+						if(votes >= (GLOBAL.config.numServers/2 + 1) ) {
+							log('elected as leader');
+							setRole(ROLES.LEADER);
+						}
+					} else if (response.voteGranted === false) {
+						log('vote rejected by server ' + _currentId);
+					} else {
+						log('remote server responded with invalid voteGranted value: ' + JSON.stringify(response.voteGranted));
+					}
+				};
+			}(currentId), function(e) { // error
+				log('failed to invoke RequestVote: ' + JSON.stringify(e));
+			});
 		}
 	}
 
 	function resetElectionTimeout() {
-		if(_this.electionTimeout) {
+		clearElectionTimeout();
+		//var next = new Date();
+		//next.setMilliseconds(next.getMilliseconds() +  _this.options.electionTimeoutInterval);
+		//log('resetElectionTimeout: next election in ' + next.toISOString());
+		_this.electionTimeout = setTimeout(startElection, _this.options.electionTimeoutInterval);
+	}
+
+	function clearElectionTimeout() {
+		if(_this.electionTimeout != null) {
 			clearTimeout(_this.electionTimeout);
+			_this.electionTimeout = null;
 		}
-		_this.electionTimeout = setTimeout(startElection, options.electionTimeoutInterval);
 	}
 	// EO Election phase
 
@@ -210,6 +253,21 @@ var Raft = function(options) {
 
 		_this.role = newRole;
 		_this.eventBus.emit('role:change');
+	}
+
+	function setTerm(newTerm) {
+		_this.state.currentTerm = newTerm;
+		_this.state.votedFor = null;
+	}
+
+	function refreshTerm(recievedTerm) {
+		// All servers: if RPC request or response contains term T > currentTerm: 
+		// set currentTerm = T, convert to follower 
+		if(recievedTerm > _this.state.currentTerm) {
+			setTerm(recievedTerm);
+			setRole(ROLES.FOLLOWER);
+			resetElectionTimeout();
+		}
 	}
 
 	// Utilities
@@ -247,7 +305,7 @@ var Raft = function(options) {
 
 	// Initialization
 
-	initialize(options);
+	initialize(_this.options);
 
 	//////////////////////////////////////////////////
 	// Public interface (RPCs)
@@ -268,13 +326,18 @@ var Raft = function(options) {
 		var response = {
 			term: _this.state.currentTerm
 		};
+
+		refreshTerm(params.term);
+
+		// Vote
 		if(params.term < _this.state.currentTerm) { // Reply false if term < currentTerm
 			response.voteGranted = false;
-		} else if (_this.state.votedFor == null || _this.state.votedFor == params.candidateId) {
+		} else if (_this.state.votedFor === null || _this.state.votedFor === params.candidateId) {
 			// If votedFor is null or candidateId, and candidate's log is at 
 			// least as up-to-date as receiver’s log, grant vote
-			resetElectionTimeout();
 			response.voteGranted = true;
+		} else {
+			response.voteGranted = false;
 		}
 
 		success(response);
@@ -295,26 +358,35 @@ var Raft = function(options) {
 	*/
 	this.followerAppendEntries = function(params, success, error) {
 		log('<- FollowerAppendEntries');
+
 		var response = {
 			term: _this.state.currentTerm
 		};
 
+		refreshTerm(params.term);
+		
+		if(_this.role === ROLES.FOLLOWER) {
+			resetElectionTimeout(); // reset election timeout to delay election
+		} else if (_this.role === ROLES.CANDIDATE) {
+			setRole(ROLES.FOLLOWER);
+		}
+
 		// Reply false if term < currentTerm (reject RPC calls from stale leaders)
 		if(params.term < _this.state.currentTerm) {
+			log('FollowerAppendEntries: rejected call from stale leader');
 			response.success = false;
 			success(response);
 			return;
 		}
 
-		// Update leader, reset election timeout
-		_this.currentLeader = leaderId;
-		resetElectionTimeout();
+		// Update leader
+		_this.currentLeader = params.leaderId;
 
-		// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-		if(params.term > _this.state.currentTerm) {
-			_this.state.currentTerm = params.term;
-			setRole(ROLES.FOLLOWER);
-		}
+		// Return success
+		response.success = true;
+		success(response);
+
+		return;
 	};
 
 	/*

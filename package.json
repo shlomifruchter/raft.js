@@ -20,6 +20,5 @@
     "url": "https://github.com/shlomifruchter/raft.js/issues"
   },
   "dependencies": {
-    "request": "~2.36.0"
   }
 }

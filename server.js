@@ -1,9 +1,10 @@
 var HttpServer = require('./HttpServer');
 var Logger = require('./Logger');
 var Raft = require('./Raft');
+var utils = require('./utils');
 
 GLOBAL.config = {
-	numServers: 3
+	numServers: 5
 };
 var host = 'localhost';
 var portRangeStart = 8080;
@@ -18,7 +19,7 @@ for(var i = 1; i <= GLOBAL.config.numServers; i++) {
 }
 
 var role = process.argv[2];
-var serverId = parseInt(process.argv[3]); // Important: server is are always integers, not strings!
+var serverId = parseInt(process.argv[3]); // Important: server ids are always integers, not strings!
 var port = portRangeStart + serverId;
 
 // Setup logger
@@ -38,7 +39,7 @@ if(role != 'logger') {
 		serverId: serverId,
 		host: host,
 		port: port,
-		electionTimeoutInterval: 4000,
+		electionTimeoutInterval: utils.randomInt(2000, 2300),
 		heartbeatTimeoutInterval: 500
 	});
 

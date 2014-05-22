@@ -45,8 +45,8 @@ var Raft = function(options) {
 	//////////////////////////////////////////////////
 
 	function initialize(options) {
-		var _state = _this.storage.restore();
-		_this.state = _state || _this.state;
+		restoreState();
+
 		_this.serverId = options.serverId;
 		_this.electionTimeoutInterval = options.electionTimeoutInterval || 500;
 		_this.heartbeatTimeoutInterval = options.heartbeatTimeoutInterval || 250;
@@ -196,7 +196,7 @@ var Raft = function(options) {
 						log('got voted by server ' + _currentId + ', total positive votes: ' + votes);
 
 						// If votes received from majority of servers: become leader
-						if(votes >= (GLOBAL.config.numServers/2 + 1) ) {
+						if(votes > GLOBAL.config.numServers/2 ) {
 							log('elected as leader');
 							setRole(ROLES.LEADER);
 						}
@@ -272,6 +272,17 @@ var Raft = function(options) {
 
 	// Utilities
 
+	function restoreState() {
+		var _state = _this.storage.restore();
+		_this.state = _state || _this.state;
+
+		log('state restored: ' + dumpState());
+	}
+
+	function persistState() {
+		_this.storage.persist(_this.state);
+	}
+
 	function roleNameById(roleId) {
 		switch(roleId) {
 			case 0:
@@ -323,6 +334,9 @@ var Raft = function(options) {
 	*/
 	this.requestVote = function(params, success, error) {
 		log('<- RequestVote');
+
+		persistState();
+
 		var response = {
 			term: _this.state.currentTerm
 		};
@@ -358,6 +372,8 @@ var Raft = function(options) {
 	*/
 	this.followerAppendEntries = function(params, success, error) {
 		log('<- FollowerAppendEntries');
+
+		persistState();
 
 		var response = {
 			term: _this.state.currentTerm
@@ -396,6 +412,10 @@ var Raft = function(options) {
 	// }
 	*/
 	this.appendEntry = function(params, sucess, error) {
+		log('<- AppendEntry');
+
+		persistState();
+
 		// Leader: if command received from client, append entry to local log, 
 		// respond after entry applied to state machine
 		if(_this.role == ROLES.LEADER) {

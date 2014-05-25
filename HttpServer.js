@@ -89,11 +89,22 @@ module.exports = function(raft) {
 					payload += chunk;
 				});
 				res.on('end', function() {
+					var parsedPayload = null;
 					try {
-						success(JSON.parse(payload));
+						parsedPayload = JSON.parse(payload);
 					} catch(e) {
+						log('parsing of payload failed: ' + payload);
 						error(e);
 					}
+
+					try {
+						success(parsedPayload);
+					} catch(e) {
+						log('success callback threw an exception: ' + e);
+						error(e);
+					}
+
+					success
 				});
 			});
 

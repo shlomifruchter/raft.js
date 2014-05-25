@@ -1,4 +1,6 @@
 var http = require('http');
+var fs = require('fs');
+var config = require('./config');
 
 var Logger = function(options) {
 
@@ -12,7 +14,26 @@ var Logger = function(options) {
 			_this._deferLog(msg);
 		} else {
 			console.log(msg);
+
+			if(config.writeToLogFile) {
+				_this._appendToLogFile(msg);
+			}
 		}
+	};
+
+	this._appendToLogFile = function(msg) {
+		var path = __dirname + config.logPath;
+		if(!fs.existsSync(path)) {
+			try {
+				fs.mkdirSync(path);
+			} catch(e) {
+				log('failed to create data directory: ' + e);
+			}
+		}
+
+		fs.appendFile(path + "/server_" + _this.options.serverId + ".log", msg + "\r\n", {
+			encoding: 'utf8'
+		});
 	};
 
 	this._deferLog = function(msg) {

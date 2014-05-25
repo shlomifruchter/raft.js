@@ -1,4 +1,5 @@
 var util = require('util');
+var config = require('./config');
 var EventEmitter = require('events').EventEmitter;
 var Storage = require('./Storage');
 var HttpServer = require('./HttpServer');
@@ -74,12 +75,25 @@ var Raft = function(options) {
 		_this.eventBus.on('role:change', function(oldRole, newRole) {
 			log("converted to " + roleNameById(_this.role) + " state: " + dumpState());
 
-			if(_this.role === ROLES.LEADER) {
+			if(_this.role == ROLES.LEADER) {
 				// start sending heartbeat message
 				resetHeartbeatTimeout();
 
 				// stop election timeout
 				clearElectionTimeout();
+
+				// initialize nextIndex[] and matchIndex[]
+				var lastLogIndex = _this.state.log.length - 1;
+				for(var id in GLOBAL.servers) {
+					var currentId = parseInt(id);
+					// Skip self
+					if(currentId === _this.serverId) {
+						continue;
+					}
+
+					_this.nextIndex[currentId] = lastLogIndex + 1;
+					_this.matchIndex[currentId] = -1; // index is 0-based, unlike in Raft paper
+				}
 			} else {
 				// stop sending heartbeat message
 				clearHeartbeatTimeout();
@@ -196,8 +210,9 @@ var Raft = function(options) {
 						log('got voted by server ' + _currentId + ', total positive votes: ' + votes);
 
 						// If votes received from majority of servers: become leader
-						if(votes > GLOBAL.config.numServers/2 ) {
-							log('elected as leader');
+						var majority = Math.floor(config.numServers/2) + 1;
+						if(votes >= majority) {
+							log('elected as leader, got ' + votes + ', min for winning is ' + majority);
 							setRole(ROLES.LEADER);
 						}
 					} else if (response.voteGranted === false) {
@@ -228,9 +243,13 @@ var Raft = function(options) {
 	}
 	// EO Election phase
 
-	function applyLogEntry(index, sucess, error) {
+	function applyLogEntry(index, success, error) {
 		log('Applying log entry ' + index);
-		success();
+		if(success instanceof Function) {
+			success({
+				status: "commited"
+			});
+		}
 	}
 
 	function log(msg) {
@@ -349,9 +368,38 @@ var Raft = function(options) {
 		} else if (_this.state.votedFor === null || _this.state.votedFor === params.candidateId) {
 			// If votedFor is null or candidateId, and candidate's log is at 
 			// least as up-to-date as receiver’s log, grant vote
-			response.voteGranted = true;
+
+			// Compare last entries in local and candidate's logs:
+			// ---------------------------------------------------
+
+			var localLastLogIndex = _this.state.log.length - 1;
+
+			if(localLastLogIndex >= 0 ) {
+				// If the logs have last entries with different terms, then the log with the later term is more up-to-date
+				if(params.lastLogTerm < _this.state.log[localLastLogIndex].term) {
+					response.voteGranted = false; // local log is more up-to-date since it last log's term is later
+				} 
+				// If the logs end with the same term, then whichever log is longer is more up-to-date.
+				else if (params.lastLogTerm === _this.state.log[localLastLogIndex].term && 
+						 localLastLogIndex > params.lastLogIndex) {
+					response.voteGranted = false; // local log is more up-to-date since it's longer
+				} else {
+					response.voteGranted = true; // remote log is at least as up-to-as as local log
+				}
+			} else { // local log is empty, grant vote only if remote log is empty as well
+				if(params.lastLogTerm === null ) {
+					response.voteGranted = true;
+				} else {
+					response.voteGranted = false;
+				}
+			}
 		} else {
 			response.voteGranted = false;
+		}
+
+		// Remember vote to prevent voting for another leader in this term
+		if(response.voteGranted) {
+			_this.state.votedFor = params.candidateId;
 		}
 
 		success(response);
@@ -411,21 +459,21 @@ var Raft = function(options) {
 	//	 entry
 	// }
 	*/
-	this.appendEntry = function(params, sucess, error) {
+	this.appendEntry = function(params, success, error) {
 		log('<- AppendEntry');
 
 		persistState();
 
 		// Leader: if command received from client, append entry to local log, 
 		// respond after entry applied to state machine
-		if(_this.role == ROLES.LEADER) {
+		if(_this.role === ROLES.LEADER) {
 			_this.state.log.push({
 				term: _this.state.currentTerm,
 				entry: params.entry
 			});
 			applyLogEntry(_this.state.log.length - 1, success, error);
 
-			// send 
+			// delay next heartbeat, since we just sent AppendEntries RPC
 			resetHeartbeatTimeout();
 		} else { // followers and candidates redirect calls to leader
 			if(_this.currentLeader) {

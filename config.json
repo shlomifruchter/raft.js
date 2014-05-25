@@ -1,0 +1,8 @@
+{
+	"numServers": 5,
+	"portRangeStart": 8080,
+	"host": "localhost",
+	"maxRedirectDepth": 3,
+	"writeToLogFile": true,
+	"logPath": "/logs"
+}

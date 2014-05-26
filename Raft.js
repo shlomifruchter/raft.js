@@ -443,6 +443,15 @@ var Raft = function(options) {
 			return;
 		}
 
+		// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+		// var localPrevLogEntry = _this.state.log[params.prevLogIndex];
+		// if(localPrevLogEntry === undefined || localPrevLogEntry.term != params.prevLogTerm) {
+		// 	log('FollowerAppendEntries: rejected call due to unmatching previous log term');
+		// 	response.success = false;
+		// 	success(response);
+		// 	return;
+		// }
+
 		// Update leader
 		_this.currentLeader = params.leaderId;
 

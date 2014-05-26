@@ -14,4 +14,22 @@ exports.setupHosts = function() {
 	}
 
 	return servers;
-}
+};
+
+exports.assert = function(condition, msg) {
+	if(!condition) {
+		throw 'assertion failed: ' + msg;
+	}
+};
+
+exports.forEachRemoteServer = function(servers, currentServerId, callback) {
+	for(var id in servers) {
+		var currentId = parseInt(id);
+		// Skip self
+		if(currentId === currentServerId) {
+			continue;
+		}
+
+		callback(currentId);
+	}
+};

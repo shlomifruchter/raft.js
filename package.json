@@ -19,6 +19,8 @@
   "bugs": {
     "url": "https://github.com/shlomifruchter/raft.js/issues"
   },
-  "dependencies": {
+  "dependencies": {},
+  "devDependencies": {
+    "jshint": "~2.5.1"
   }
 }

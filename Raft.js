@@ -1,4 +1,4 @@
-var util = require('util');
+var utils = require('./utils');
 var config = require('./config');
 var EventEmitter = require('events').EventEmitter;
 var Storage = require('./Storage');
@@ -8,6 +8,12 @@ var ROLES = {
 	FOLLOWER: 0,
 	CANDIDATE: 1,
 	LEADER: 2
+};
+
+var ERROR_CODES = {
+	E_SUCCESS: 0,
+	E_INCONSISTENT_PREV_ENTRY: 1,
+	E_STALE_LEADER: 2
 };
 
 var Raft = function(options) {
@@ -29,8 +35,8 @@ var Raft = function(options) {
 	};
 
 	// Volatile state on all servers
-	this.commitIndex = 0;
-	this.lastApplied = 0;
+	this.commitIndex = -1; // index is 0-based, unlike in Raft paper
+	this.lastApplied = -1; // index is 0-based, unlike in Raft paper
 	this.currentLeader = null;
 
 	this.role = ROLES.FOLLOWER; // all nodes starts as followers
@@ -58,17 +64,20 @@ var Raft = function(options) {
 		resetElectionTimeout(); // start election timeout
 
 		log('Raft initialized');
-	};
+	}
 
 	function setupEvents() {
 		_this.eventBus.on('commitIndex:change', function() {
-			if(_this.commitIndex > _this.lastApplied) {
+			var currentLogIndex = _this.lastApplied + 1;
+
+			while(currentLogIndex <= _this.commitIndex) {
 				try {
-					applyLogEntry(_this.lastApplied+1);
-					_this.lastApplied++;
+					applyLogEntry(currentLogIndex);
 				} catch(e) {
-					log('failed to apply log entry ' + (_this.lastApplied+1));
+					log('failed to apply log entry ' + currentLogIndex);
 				}
+
+				currentLogIndex++;
 			}
 		});
 
@@ -130,26 +139,20 @@ var Raft = function(options) {
 					prevLogTerm: null,
 					entries: [],
 					leaderCommit: _this.commitIndex
-				}, function(_currentId) {
-					return function(response) { // success
-						refreshTerm(response.term);
+				}, function(response) { // success
+					if(response === undefined) {
+						log('heartbeat FollowerAppendEntries: invalid response');
+					}
 
-						if(_this.role != ROLES.LEADER) { // Reject responses if no longer a leader
-							log('rejected FollowerAppendEntries response: not a leader');
-							return;
-						}
+					refreshTerm(response.term);
 
-						log('FollowerAppendEntries response: ' + JSON.stringify(response));
+					if(_this.role !== ROLES.LEADER) { // Reject responses if no longer a leader
+						log('rejected FollowerAppendEntries response: not a leader');
+						return;
+					}
 
-						if(response.success === true) {
-							//  update nextIndex and matchIndex for follower
-						} else if(response.success === false) {
-							// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
-						} else {
-							log('remote server responded with invalid success value: ' + JSON.stringify(response.success));
-						}
-					};
-				}(currentId), function(e) { // error
+					log('FollowerAppendEntries response: ' + JSON.stringify(response));
+				}, function(e) { // error
 					log('failed to invoke FollowerAppendEntries: ' + JSON.stringify(e));
 				});
 			}
@@ -157,10 +160,78 @@ var Raft = function(options) {
 	}
 
 	function clearHeartbeatTimeout() {
-		if(_this.heartbeatTimeout != null) {
+		if(_this.heartbeatTimeout !== null) {
 			clearTimeout(_this.heartbeatTimeout);
 			_this.heartbeatTimeout = null;
 		}
+	}
+
+	function appendEntriesToRemoteServer(remoteServerId, success, error) {
+		log('appendEntriesToRemoteServer: remoteServerId=' + remoteServerId);
+		// If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
+		var lastLogIndex = _this.state.log.length - 1;
+		if(lastLogIndex >= _this.nextIndex[remoteServerId]) {
+			var prevLogIndex = _this.nextIndex[remoteServerId] - 1; // should be -1 for first entry
+			var prevLogTerm = prevLogIndex >= 0 ? _this.state.log[prevLogIndex].term : null;
+			var entries = _this.state.log.slice(prevLogIndex+1);
+
+			log('FollowerAppendEntries -> server ' + remoteServerId + ' , sending ' + entries.length + ' entries');
+
+			_this.httpServer.invokeRPC(remoteServerId, 'FollowerAppendEntries', {
+				term: _this.state.currentTerm,
+				leaderId: _this.serverId,
+				prevLogIndex: prevLogIndex,
+				prevLogTerm: prevLogTerm,
+				entries: entries,
+				leaderCommit: _this.commitIndex
+			}, function(_currentId) {
+				return function(response) { // success
+					if(response === undefined) {
+						log('appendEntriesToRemoteServer:FollowerAppendEntries: invalid response');
+					}
+
+					refreshTerm(response.term);
+
+					if(_this.role != ROLES.LEADER) { // Reject responses if no longer a leader
+						log('rejected FollowerAppendEntries response: not a leader');
+						error({
+							message: 'rejected FollowerAppendEntries response: not a leader'
+						});
+						return;
+					}
+
+					log('FollowerAppendEntries response: ' + JSON.stringify(response));
+
+					if(response.success === true) {
+						//  update nextIndex and matchIndex for follower
+						_this.nextIndex[_currentId] = lastLogIndex + 1; // index of the next log entry to send to that server
+						_this.matchIndex[_currentId] = lastLogIndex; // index of highest log entry known to be replicated on server
+						success(response);
+						return;
+					} else if(response.success === false) {
+						// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
+						if(response.errorCode === ERROR_CODES.E_INCONSISTENT_PREV_ENTRY) {
+							_this.nextIndex[_currentId]--;
+							appendEntriesToRemoteServer(remoteServerId, success, error); // retry
+							return;
+						} else { // handle other errors
+							error({
+								message: 'replication failed with response: ' + JSON.stringify(response)
+							});
+							return;
+						}
+					} else {
+						log('remote server responded with invalid success value: ' + JSON.stringify(response.success));
+						error({
+							message: 'remote server responded with invalid success value'
+						});
+						return;
+					}
+				};
+			}(remoteServerId), function(e) { // error
+				log('failed to invoke FollowerAppendEntries: ' + JSON.stringify(e));
+			});
+		}		
 	}
 
 	// EO Leader
@@ -191,37 +262,37 @@ var Raft = function(options) {
 			var lastLogIndex = _this.state.log.length - 1;
 			log('RequestVote -> server ' + currentId);
 
+			var requestVoteSuccessHandler = function(_currentId, response) { // success
+				refreshTerm(response.term);
+
+				if(_this.role != ROLES.CANDIDATE) { // Reject response if no longer a candidate
+					log('rejected RequestVote response: not a candidate');
+					return;
+				}
+
+				if(response.voteGranted === true) {
+					votes++;
+					log('got voted by server ' + _currentId + ', total positive votes: ' + votes);
+
+					// If votes received from majority of servers: become leader
+					var majority = Math.floor(config.numServers/2) + 1;
+					if(votes >= majority) {
+						log('elected as leader, got ' + votes + ', min for winning is ' + majority);
+						setRole(ROLES.LEADER);
+					}
+				} else if (response.voteGranted === false) {
+					log('vote rejected by server ' + _currentId);
+				} else {
+					log('remote server responded with invalid voteGranted value: ' + JSON.stringify(response.voteGranted));
+				}
+			};
+
 			_this.httpServer.invokeRPC(currentId, 'RequestVote', {
 				term: _this.state.currentTerm,
 				candidateId: _this.serverId,
 				lastLogIndex: lastLogIndex,
 				lastLogTerm: lastLogIndex >= 0 ? _this.state.log[lastLogIndex].term : null
-			}, function(_currentId) {
-				return function(response) { // success
-					refreshTerm(response.term);
-
-					if(_this.role != ROLES.CANDIDATE) { // Reject response if no longer a candidate
-						log('rejected RequestVote response: not a candidate');
-						return;
-					}
-
-					if(response.voteGranted === true) {
-						votes++;
-						log('got voted by server ' + _currentId + ', total positive votes: ' + votes);
-
-						// If votes received from majority of servers: become leader
-						var majority = Math.floor(config.numServers/2) + 1;
-						if(votes >= majority) {
-							log('elected as leader, got ' + votes + ', min for winning is ' + majority);
-							setRole(ROLES.LEADER);
-						}
-					} else if (response.voteGranted === false) {
-						log('vote rejected by server ' + _currentId);
-					} else {
-						log('remote server responded with invalid voteGranted value: ' + JSON.stringify(response.voteGranted));
-					}
-				};
-			}(currentId), function(e) { // error
+			}, requestVoteSuccessHandler.bind(_this, currentId), function(e) { // error
 				log('failed to invoke RequestVote: ' + JSON.stringify(e));
 			});
 		}
@@ -229,14 +300,11 @@ var Raft = function(options) {
 
 	function resetElectionTimeout() {
 		clearElectionTimeout();
-		//var next = new Date();
-		//next.setMilliseconds(next.getMilliseconds() +  _this.options.electionTimeoutInterval);
-		//log('resetElectionTimeout: next election in ' + next.toISOString());
 		_this.electionTimeout = setTimeout(startElection, _this.options.electionTimeoutInterval);
 	}
 
 	function clearElectionTimeout() {
-		if(_this.electionTimeout != null) {
+		if(_this.electionTimeout !== null) {
 			clearTimeout(_this.electionTimeout);
 			_this.electionTimeout = null;
 		}
@@ -245,6 +313,7 @@ var Raft = function(options) {
 
 	function applyLogEntry(index, success, error) {
 		log('Applying log entry ' + index);
+		_this.lastApplied = index;
 		if(success instanceof Function) {
 			success({
 				status: "commited"
@@ -261,8 +330,8 @@ var Raft = function(options) {
 	// Mutators
 
 	function setCommitIndex(newCommitIndex) {
-		commitIndex = newCommitIndex;
-		eventBus.emit('commitIndex:change');
+		_this.commitIndex = newCommitIndex;
+		_this.eventBus.emit('commitIndex:change');
 	}
 
 	function setRole(newRole) {
@@ -427,6 +496,10 @@ var Raft = function(options) {
 			term: _this.state.currentTerm
 		};
 
+		/////////////////////////////////
+		// Election and heartbeat logic
+		/////////////////////////////////
+
 		refreshTerm(params.term);
 		
 		if(_this.role === ROLES.FOLLOWER) {
@@ -439,21 +512,66 @@ var Raft = function(options) {
 		if(params.term < _this.state.currentTerm) {
 			log('FollowerAppendEntries: rejected call from stale leader');
 			response.success = false;
+			response.errorCode = ERROR_CODES.E_STALE_LEADER;
 			success(response);
 			return;
 		}
 
-		// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-		// var localPrevLogEntry = _this.state.log[params.prevLogIndex];
-		// if(localPrevLogEntry === undefined || localPrevLogEntry.term != params.prevLogTerm) {
-		// 	log('FollowerAppendEntries: rejected call due to unmatching previous log term');
-		// 	response.success = false;
-		// 	success(response);
-		// 	return;
-		// }
-
 		// Update leader
 		_this.currentLeader = params.leaderId;
+
+		// Non-null preLogIndex means a non-hearbeat message
+		if(params.prevLogIndex !== null) {
+			/////////////////////////////////
+			// Log replication logic
+			/////////////////////////////////
+
+			// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+			if(params.prevLogIndex >= 0) { // make sure the prev index is not -1
+				var localPrevLogEntry = _this.state.log[params.prevLogIndex];
+				if(localPrevLogEntry === undefined || localPrevLogEntry.term != params.prevLogTerm) {
+					log('FollowerAppendEntries: rejected call due to unmatching previous log term: localPrevLogEntry=' + JSON.stringify(localPrevLogEntry) + ' prevLogTerm=' + params.prevLogTerm);
+					response.success = false;
+					response.errorCode = ERROR_CODES.E_INCONSISTENT_PREV_ENTRY;
+					success(response);
+					return;
+				}
+			}
+			
+
+			var currentLogIndex = params.prevLogIndex;
+
+			// Iterate through new log entries
+			for(var i in params.entries) {
+				currentLogIndex++;
+
+				var localExistingLogEntry = _this.state.log[currentLogIndex];
+
+				// Append any new entries not already in the log
+				if(localExistingLogEntry === undefined) {
+					_this.state.log[currentLogIndex] = params.entries[i];
+					log('log entry ' + currentLogIndex + ' created: ' + params.entries[i].entry);
+				} else { 
+					// If an existing entry conflicts with a new one (same index but different terms),
+					// delete the existing entry and all that follow it
+					if(localExistingLogEntry.term !== params.term) {
+						_this.state.log.splice(currentLogIndex); // remove all log entries starting from first new entry index
+						log('log entries from index ' + currentLogIndex + ' deleted');
+						_this.state.log[currentLogIndex] = params.entries[i]; // Append any new entries not already in the log
+						log('log entry ' + currentLogIndex + ' created: ' + params.entries[i].entry);
+					} else {
+						// terms are matching - entries should match as well
+						utils.assert(_this.state.log[currentLogIndex].entry === params.entries[i].entry, 'entry terms are matching - entry data should match as well');
+					}
+				}
+			}
+		}
+
+		// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+		// This should be handled for heartbeat messages as well
+		if(params.leaderCommit > _this.commitIndex) {
+			setCommitIndex(Math.min(params.leaderCommit, _this.state.log.length-1)); // currentLogIndex should be the index of the last new entry
+		}
 
 		// Return success
 		response.success = true;
@@ -480,10 +598,52 @@ var Raft = function(options) {
 				term: _this.state.currentTerm,
 				entry: params.entry
 			});
+			persistState(); // TODO: Make sure it is correct to persist state here!
 			applyLogEntry(_this.state.log.length - 1, success, error);
 
 			// delay next heartbeat, since we just sent AppendEntries RPC
 			resetHeartbeatTimeout();
+
+			try {
+				// replicate log to all servers
+				utils.forEachRemoteServer(GLOBAL.servers, _this.serverId, function(currentId) {
+					appendEntriesToRemoteServer(currentId, function(response) { // success
+						// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
+						// and log[N].term == currentTerm: set commitIndex = N
+
+						log('Check if commit index should be changed');
+
+						// Check if commit index should be changed
+						var N = _this.state.log.length - 1;
+						while(N > _this.commitIndex) {
+							if(_this.state.log[N].term === _this.state.currentTerm) {
+
+								// count {i : matchIndex[i] ≥ N}
+								var count = 0;
+								utils.forEachRemoteServer(GLOBAL.servers, _this.serverId, function(sid) {
+									if(_this.matchIndex[sid] >= N) {
+										count++;
+									}
+								});
+
+								var majority = Math.floor(config.numServers/2) + 1;
+								if(count >= majority) {
+									log('commit index was set to ' + N);
+									setCommitIndex(N);
+								}
+								
+								break;
+							}
+
+							N--;
+						}
+					}, function(response) { // error
+						log('appendEntriesToRemoteServer failed, response: ' + JSON.stringify(response));
+					});
+				});
+			} catch(e) {
+				log('exception thrown while appending entries to remote servers: ' + e);
+			}
 		} else { // followers and candidates redirect calls to leader
 			if(_this.currentLeader) {
 				success({

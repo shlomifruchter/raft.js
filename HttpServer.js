@@ -15,11 +15,19 @@ module.exports = function(raft) {
 
 	function handleRPC(method, params, success, error) {
 		if(_this.methods[method] instanceof Function) {
-			_this.methods[method](params, success, error);
+			try {
+				_this.methods[method](params, success, error);
+			} catch (e) {
+				error({
+					message: 'failed to handle RPC: ' + method + ' , exception: ' + e
+				});
+				return;
+			}
 		} else {
 			error({
 				message: 'undefined RPC: ' + method
 			});
+			return;
 		}
 	}
 
@@ -93,18 +101,18 @@ module.exports = function(raft) {
 					try {
 						parsedPayload = JSON.parse(payload);
 					} catch(e) {
-						log('parsing of payload failed: ' + payload);
+						log('invokeRPC for ' + method + ': parsing of payload failed: ' + payload);
 						error(e);
+						return;
 					}
 
 					try {
 						success(parsedPayload);
 					} catch(e) {
-						log('success callback threw an exception: ' + e);
+						log('invokeRPC for ' + method + ': success callback threw an exception: ' + e);
 						error(e);
+						return;
 					}
-
-					success
 				});
 			});
 

@@ -31,7 +31,7 @@ var Logger = function(options) {
 			}
 		}
 
-		fs.appendFile(path + "/server_" + _this.options.serverId + ".log", msg + "\r\n", {
+		fs.appendFileSync(path + "/server_" + _this.options.serverId + ".log", msg + "\r\n", {
 			encoding: 'utf8'
 		});
 	};
